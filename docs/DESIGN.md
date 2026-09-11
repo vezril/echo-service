@@ -146,3 +146,55 @@ spec prose would look for `kind == "poster"` and render a broken player.
 `MediaProcessed`. The real path is Echo → Apollo + Artemis upload → Artemis publishes → Hephaestus,
 with **Echo never talking to Hephaestus directly** (so: no Hephaestus client in Echo). Pending
 confirmation from the Hephaestus session.
+
+## Decision — titles become tags at ingest (Calvin, 2026-09-11)
+
+Artemis has no free-text index and full-text search is not on its backlog (§4). **Echo tokenizes
+video titles into tags at ingest.** No Artemis change is requested. This supersedes the canonical
+note's `title/description → searchable text` mapping in all three places it appears.
+
+### Follow the Argus precedent: surface form only
+
+Argus already solved machine-generated tagging here, and its division of labour is the one to copy
+(`argus/normalize.py`): a producer normalizes **surface form only** and never does meaning-level
+merging — `outdoor` is not aliased to `outdoors`. Artemis owns canonicalization downstream via its
+alias/implication graph (`TagCanonicalization.scala`).
+
+Echo's normalization must match `Tag.normalize` (`Tag.scala:33`) exactly, since Artemis applies it
+server-side regardless:
+
+```
+input.trim.toLowerCase → replaceAll("[\s_]+", "_") → strip leading/trailing "_"
+```
+
+plus Artemis's rejects: empty-after-normalization, and longer than `MaxLength`. Argus's
+`normalize_surface_form` is the same function in Python — reuse it rather than re-deriving.
+
+### The real work is filtering, and it carries a blast radius
+
+YouTube titles are clickbait-dense: emoji, `(OFFICIAL VIDEO)`, `| Ep. 12`, ALL-CAPS, `#shorts`,
+channel-name suffixes. Naive tokenization yields tags like `the`, `2`, `official`, `_`.
+
+**The tag vocabulary is shared across the whole gallery**, so a sloppy Echo tokenizer degrades
+search for images Echo never touched — including Argus's auto-tags. Bias conservative: drop
+stopwords, pure numbers, single characters, and punctuation-only tokens; prefer emitting too few
+tags over polluting the vocabulary. Junk tags are cheap to create and expensive to retract (tags
+PATCH is a full-set replace — §4 — so retraction means rewriting every affected post's complete
+tag set).
+
+### Structured facts do NOT go through the tokenizer
+
+- channel → **pool** (§4)
+- uploader → **artist-tag** (§4; note `TagCategory.fromPrefix` — the category prefix is the
+  mechanism)
+- YouTube video id / URL → **`source`**, which is exact-match only (`exactString("source", value)`).
+  Pick one canonical form — bare video id or full watch URL — and never vary it, or lookup silently
+  returns nothing.
+
+### Open — where does the verbatim title live?
+
+Tokenizing is lossy, and Artemis appears to have no field that stores the original title as-is. If
+nothing holds it, the human-readable title is gone after ingest and the gallery shows a post with
+tags but no name. Options, none chosen: a `title:`-prefixed metatag, an Artemis field request (small
+— storage, not search), or Echo keeping its own channel→video record. **Resolve before building
+`ingest/`.** Do not assume the title survives.
