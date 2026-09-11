@@ -42,8 +42,17 @@ egress). Chart in `codex/charts/echo`.
 
 ## Open / to coordinate
 
-- **Artemis watched-state** (viewed flag + last-viewed timestamp) — gates the stale nudge.
-- **Video player in artemis-ui** — the "view in Artemis" experience.
+*Superseded in part — see the dated coordination sections below. Current state as of 2026-09-11:*
+
+- **Artemis must request the transcode** — the live blocker for video playback, and a pre-existing
+  Artemis bug rather than an Echo dependency (§5; confirmed by the Artemis session 2026-09-11, which
+  is taking it to Calvin as a bug needing a fix authorized, not a feature greenlit).
+- ~~**Video player in artemis-ui**~~ — **not needed.** artemis-ui already plays video (§1). The
+  original entry pointed at the wrong seam.
+- **Artemis watched-state** (viewed flag + last-viewed timestamp) — gates the stale nudge. Surfaced
+  to Calvin 2026-09-09; **no direction given, nothing built, no date.** Do not plan around it
+  landing — design the notify module against the fallback path (§3).
+- **`pool:` metatag** — same status: surfaced, unauthorized, no date (§3).
 - **Stale-window default** — 14d proposed.
 
 ## Coordination findings — Artemis session, 2026-09-09
