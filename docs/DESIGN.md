@@ -45,3 +45,104 @@ egress). Chart in `codex/charts/echo`.
 - **Artemis watched-state** (viewed flag + last-viewed timestamp) — gates the stale nudge.
 - **Video player in artemis-ui** — the "view in Artemis" experience.
 - **Stale-window default** — 14d proposed.
+
+## Coordination findings — Artemis session, 2026-09-09
+
+Verified against `artemis-service` / `artemis-ui` at the file:line refs the Artemis session gave
+(each independently re-checked here). **These supersede the corresponding assumptions in the
+canonical note** — `codex/docs/echo.md` has not been updated yet and is the Codex session's tree to
+change; route these to it. Nothing below is committed Artemis work: it's a design thread the
+Artemis session is surfacing to Calvin, who decides whether it becomes an OpenSpec change.
+
+### 1. Video support already exists — the risk is elsewhere
+
+Video is first-class through Artemis (`Dimensions.duration`, a `duration` read-model column,
+`is:video` → `duration IS NOT NULL`, `duration:>=30` and `order:duration`, and a real `<video>` in
+`media-view.tsx` with a placeholder when no transcode is ready). **No player work is needed.**
+
+The Artemis session flagged the **derivative naming contract with Hephaestus** as the untested seam
+(the UI picks the playable ref by `kind === "transcode"`; `MediaRoutes` serves from the post's
+*stored* refs; a key-layout drift is what 404'd every image in v1.2.0, fixed in v1.2.1).
+
+**Checked against `hephaestus-service` on 2026-09-10 — the contract already holds, and the real gap
+is in Artemis instead.** See §5.
+
+### 2. Watched-state — shape decided against a read-model-only projection
+
+A read-model-only column is **wrong here**: read-model tables are declared rebuildable (drop and
+replay from offset zero, `ddl/create_tables_postgres.sql:71`), and rebuilds are routine. Watched
+state is *authored*, not derived — a projection-only column is silent data loss.
+
+Proposed shape (Artemis's, and it follows existing `Favorited`/`Unfavorited` precedent, which is the
+same class of high-frequency single-user state):
+
+- additive event `PostViewed(at: Instant)` — satisfies the additive-only journal rule
+- projection columns `last_viewed_at TIMESTAMPTZ` (+ optional `view_count`), partial index
+- route `POST /posts/{id}/view`, mirroring the existing `/posts/{id}/favorite`
+- DSL: an `unviewed:` / `viewed:<date` metatag
+
+The earlier Echo-side worry ("high-frequency state is wrong for an event-sourced aggregate") does
+not bite at this scale — views are human-paced, single-user, on a LAN.
+
+### 3. The stale-nudge query has a SECOND dependency
+
+`pool:` is currently **`UnsupportedMetatag`** (`SqlCompiler.scala:160`, stubbed with `ordpool`), so
+"unwatched posts in pool X" needs pool reverse-lookup *and* watched-state — two Artemis items, not
+one. Pool reverse-lookup was already on Artemis's deferred backlog; Echo is now a downstream
+consumer of it.
+
+**Fallback if `pool:` slips:** `GET /pools/{id}/posts` exists and is keyset-paginated on
+`(position, post_id)`. With `last_viewed_at` on the post it could take an `unviewed=true` param, or
+Echo filters the page client-side. The notify module is not blocked on the metatag.
+
+### 4. Metadata mapping — one of the three does NOT hold
+
+- `channel → pool` — fits. `removePoolPost` renumbers positions densely; keep appends going through
+  the API and the invariant holds.
+- `uploader → artist-tag` — fits, with a footgun: **tags PATCH is a full-set replace, not a delta.**
+  Send the complete tag set on every write or tags are silently dropped.
+- `title/description → searchable text` — **does not exist.** Artemis search is tag-based plus
+  metatags; there is no free-text field and no full-text index (`source` is exact-match only,
+  `exactString("source", value)`; no tsvector/ILIKE anywhere in the compiler). Full-text search is
+  not on Artemis's backlog and is meaningfully larger than watched-state.
+
+  **Consequence for Echo:** either Echo tokenizes titles into tags at ingest (Echo's side, no
+  Artemis change — the likely answer), or full-text becomes a new Artemis capability. **Do not
+  design Echo's or echo-ui's search UX assuming free-text.** This is the correction most likely to
+  change Echo's plans, and it contradicts the canonical note in three places.
+
+### 5. The transcode is never requested — verified gap, 2026-09-10
+
+Verified directly in `hephaestus-service` / `artemis-service`. **Hephaestus already produces
+everything Echo needs, and needs no change:**
+
+- `DerivativePlan.plan` emits `DerivativeKind.Transcode` for `MediaType.Video` — `720p.mp4`, h264,
+  `video/mp4`, `variant = "720p"`; video also gets a poster-frame thumbnail + sample poster
+- wire tokens are exactly `thumb` / `sample` / `transcode` (`MediaModel.scala:49`, locked by
+  `DerivativeKindSpec`) — and `transcode` is precisely what artemis-ui's `viewVariant` selects on
+- keys are content-addressed: `derivatives/<md5[0:2]>/<md5>/<name>`
+
+**But the transcode is gated on the job's `want` set, and Artemis hardcodes it to image kinds:**
+
+- `UploadService.scala:156` → `want = Seq("thumb", "sample")`
+- `ReprocessService.scala:57` (the `Derivatives` reprocess lane) → `Seq("thumb", "sample")`
+
+Neither branches on `mediaType`; neither ever requests `"transcode"`. **Consequence:** a video
+ingested through Artemis's normal upload path gets no transcode at all — artemis-ui finds no
+`kind === "transcode"`, its `.mp4|webm|mkv|mov` extension fallback finds nothing either, and the
+post shows the not-ready placeholder forever. The reprocess-derivatives lane would not backfill it.
+
+This is a one-line-ish fix in Artemis (branch `want` on media type), **not** a Hephaestus change.
+Open question routed to Hephaestus: its spec calls the video transcode *eager*, but the plan's
+`want` gate makes it producer-opt-in — if `MediaType.Video` implied the transcode server-side, this
+bug class would vanish for every producer. That's Hephaestus's call; it owns the job contract.
+
+**Spec-vs-code discrepancy to close:** `media-processing/spec.md:125` says derivatives include a
+`poster`, but no `poster` kind exists — the poster ships as `thumb`. A consumer building from the
+spec prose would look for `kind == "poster"` and render a broken player.
+
+**Topology correction:** the canonical note says Echo hands files to Hephaestus. That looks wrong —
+`UploadService` creates the post and publishes `ProcessMediaJob`; `MediaResultHandler` consumes
+`MediaProcessed`. The real path is Echo → Apollo + Artemis upload → Artemis publishes → Hephaestus,
+with **Echo never talking to Hephaestus directly** (so: no Hephaestus client in Echo). Pending
+confirmation from the Hephaestus session.
