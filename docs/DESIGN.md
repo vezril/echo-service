@@ -198,3 +198,37 @@ nothing holds it, the human-readable title is gone after ingest and the gallery 
 tags but no name. Options, none chosen: a `title:`-prefixed metatag, an Artemis field request (small
 — storage, not search), or Echo keeping its own channel→video record. **Resolve before building
 `ingest/`.** Do not assume the title survives.
+
+## Resolved — the verbatim title lives in Echo, not Artemis (2026-09-11)
+
+**Verified:** the `posts` table has **no** title/name/description column (`create_tables_postgres.sql`);
+`source TEXT` is the only free-form string, and search treats it as exact-match
+(`exactString("source", value)`). A `title:`-prefixed *tag* doesn't solve it either — tags go
+through `Tag.normalize`, so they're lossy by construction. Artemis genuinely cannot hold a verbatim
+title today.
+
+**Decision: Echo stores the verbatim title in its own state. No Artemis change is requested.**
+
+The reasoning is that Echo needs a datastore regardless — it must record which video ids a channel
+has already yielded (new-upload detection and re-download avoidance), the `handle → channel_id`
+resolution, backfill position, and the per-item queue/retry/error state that `echo-ui` exists to
+display. Once that store exists, holding the title costs nothing, and it keeps a cosmetic concern
+from turning into an event-sourcing change in another team's repo.
+
+**Join key: `source`.** Echo stamps one canonical YouTube form on the post's `source` (§ titles→tags
+— bare video id or full watch URL, chosen once and never varied) and keys its own record by the same
+value. `source` is exact-match searchable, which is precisely the lookup this needs, so the mapping
+works in both directions: post → Echo record, and Echo record → post.
+
+**The cost, stated honestly:** a video browsed in artemis-ui shows tags and a poster frame, but no
+title. Full titles appear in `echo-ui`, not the gallery. That is a real downgrade for video and is
+accepted, for two reasons: the gallery is an image-first surface that identifies posts visually by
+thumbnail rather than by name, and video posts still carry the poster frame Hephaestus generates
+(§5), so they are not anonymous — just untitled.
+
+**If it grates in practice**, the fallback is a small, well-scoped ask: a display-name/title field on
+the post — *storage only, not search, and not full-text*, which is far cheaper than the full-text
+index rejected in §4. Deferred deliberately: don't spend another repo's budget on a cosmetic
+question before Calvin has actually browsed video posts in the gallery and formed an opinion.
+
+`ingest/` is unblocked.
