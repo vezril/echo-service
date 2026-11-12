@@ -42,7 +42,7 @@ uv run ruff format .        # format
 uv run mypy src             # types (strict)
 ```
 
-Docker: `docker build -t calvinference/echoservice .` then `docker run calvinference/echoservice`.
+Docker: `docker build -t calvinference/echo .` then `docker run calvinference/echo`.
 The Dockerfile ships regardless of Docker Hub wiring — publishing is CI's job and is gated on
 secrets.
 
