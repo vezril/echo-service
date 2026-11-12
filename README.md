@@ -4,8 +4,10 @@ Echo follows YouTube channels **without a Google account**, downloads new upload
 feeds them into the constellation's media pipeline for viewing in Artemis + notifications. The last
 piece of the de-google project.
 
-**Status:** SEED (2026-09-08). Design captured, not built. Canonical design + rationale:
-`codex/docs/echo.md`; service-scoped shape in [docs/DESIGN.md](docs/DESIGN.md).
+**Status:** SCAFFOLDED (2026-11-12). Build, CI and the module skeleton are in place; **no behaviour
+is implemented yet** — `python -m echo` exits non-zero by design. Canonical design + rationale:
+`codex/docs/echo.md`; service-scoped shape and the verified cross-service findings in
+[docs/DESIGN.md](docs/DESIGN.md).
 
 ## What it does
 
@@ -25,10 +27,28 @@ Greek name = software. Deploys are the **Codex** session's (pin-first, mirrored-
 in Artemis, poster/transcode in Hephaestus — with those sessions (a relay is queued in
 session-coordination.md). Mark/accent: **none yet** (generate via the constellation-logo pipeline).
 
-## Build (when it's a go)
+## Build
 
-Not built. When it is: Python 3.12 + uv (the `new-python-project` pattern), `yt-dlp`, a Hermes
-client. The channel-follow config schema is in `codex/docs/echo.md`.
+Python 3.12 + uv. Sources in `src/echo/` (`follow/`, `fetch/`, `ingest/`, `notify/` — the four
+pieces the design names); pytest suite in `tests/`. The channel-follow config schema is in
+`codex/docs/echo.md`.
+
+```bash
+uv sync                     # environment + lockfile
+uv run pytest               # tests
+uv run python -m echo       # entry point (exits 1 until implemented)
+uv run ruff check .         # lint
+uv run ruff format .        # format
+uv run mypy src             # types (strict)
+```
+
+Docker: `docker build -t calvinference/echoservice .` then `docker run calvinference/echoservice`.
+The Dockerfile ships regardless of Docker Hub wiring — publishing is CI's job and is gated on
+secrets.
+
+**CI/CD:** `ci.yml` runs format, lint, types, tests and a secret scan on PRs; `dev.yml` publishes
+`:dev` images from `development`; `release.yml` publishes `:X.Y.Z` + `:latest` from a `vX.Y.Z` tag
+on `main`. Image publishing skips gracefully while the `DOCKERHUB_*` secrets are absent.
 
 ## License
 
