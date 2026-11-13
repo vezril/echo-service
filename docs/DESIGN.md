@@ -241,3 +241,65 @@ index rejected in §4. Deferred deliberately: don't spend another repo's budget 
 question before Calvin has actually browsed video posts in the gallery and formed an opinion.
 
 `ingest/` is unblocked.
+
+## Implementation — `follow/` landed (2026-11-13)
+
+First behaviour in the repo. `follow/` is four pieces, split so that every decision with a
+consequence is a pure function and only two of them touch the network:
+
+| module | owns | network |
+|---|---|---|
+| `follow/config.py` | parse / deep-merge / validate the channel-follow file | no |
+| `follow/feed.py` | the Atom parser (pure) + a conditional-GET `FeedClient` | yes |
+| `follow/resolve.py` | `handle`/`url` → `channel_id`, once per channel | yes |
+| `follow/detect.py` | which entries are new; what backfill does on first sync | no |
+
+Decisions taken while building, none of which contradict the canonical note:
+
+- **Config rejects unknown keys** rather than ignoring them. A silently-dropped `max_hieght`
+  looks like a working config that quietly downloads 4K forever, and this file is hand-edited.
+- **`yaml.safe_load` only** — the file is hand-edited, so `yaml.load` would make it a
+  code-execution path. Covered by a test.
+- **Deep-merge recurses only into the documented nested blocks**; lists replace wholesale, so
+  an inherited `extra_tags` can be overridden *down* rather than only appended to.
+- **Title-filtered and backfill-skipped entries are recorded as seen, not dropped.** Without
+  that, every poll re-evaluates the same rejects forever, and an older entry still inside the
+  feed window gets re-fetched.
+- **Resolution is restricted to youtube.com hosts** (and re-checked after redirects). The URL
+  comes from a config file; a fetcher that follows any URL a file names is a request-forgery
+  lever pointed at whatever the worker can reach on the cluster network.
+- **Responses are read under a size cap, streamed** — remote input, so an unbounded read is a
+  memory lever held by whatever answers the URL.
+- **Conditional GET** (`If-None-Match` / `If-Modified-Since`). Polling someone else's free
+  endpoint every 30 minutes forever should usually cost them a 304, which also makes a tighter
+  `poll_interval` cheap. Callers must persist the returned `etag` / `last_modified`.
+
+### Verified: what the feed does NOT carry (constrains `fetch/`)
+
+The per-channel Atom feed gives video id, title, watch URL, channel id, author, `published`,
+`updated`, a thumbnail URL and a description. It does **not** give:
+
+- **duration** — so `filters.min_duration` / `max_duration` *cannot* be applied before the
+  download decision at feed level. They belong to `fetch/`, against yt-dlp's extracted
+  metadata (`--match-filter`), not to `follow/`.
+- **a Shorts flag or a livestream flag** — so `shorts` and `livestreams` are likewise `fetch/`
+  decisions. A Short is an ordinary entry; the common proxy is the duration bound, which is
+  why `min_duration: 60s` is the default.
+- **history** — the feed is a **window of roughly 15 entries, newest first**. Two consequences:
+  a channel that uploads faster than Echo polls will drop uploads off the end before they are
+  ever seen (that is what `poll_interval` is really tuning), and **`backfill` can never reach
+  further back than the window**, whatever number the config names. `backfill: 50` on a
+  long-running channel yields ~15, not 50.
+
+Only `title_include` / `title_exclude` are decidable in `follow/`, and that is where they run.
+
+### Still open, in the order they now block work
+
+1. **The canonical `source` form — bare video id or full watch URL.** Unchosen, and it is the
+   join key between the Artemis post and Echo's own record (§ titles→tags). **Blocks `ingest/`**
+   and should be decided before Echo's datastore is written, because the store keys on it.
+2. **Echo's own datastore** — seen video ids, `handle → channel_id`, verbatim titles, queue /
+   retry / error state for `echo-ui`. `follow/` currently takes `seen` as a plain collection and
+   returns what to record, so the store can land without reopening it.
+3. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
+   date. `notify/` designs against the `GET /pools/{id}/posts` fallback.

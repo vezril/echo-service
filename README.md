@@ -4,10 +4,11 @@ Echo follows YouTube channels **without a Google account**, downloads new upload
 feeds them into the constellation's media pipeline for viewing in Artemis + notifications. The last
 piece of the de-google project.
 
-**Status:** SCAFFOLDED (2026-11-12). Build, CI and the module skeleton are in place; **no behaviour
-is implemented yet** — `python -m echo` exits non-zero by design. Canonical design + rationale:
-`codex/docs/echo.md`; service-scoped shape and the verified cross-service findings in
-[docs/DESIGN.md](docs/DESIGN.md).
+**Status:** IN PROGRESS (2026-11-13). `follow/` is implemented — config, feed polling, handle
+resolution and new-upload detection. `fetch/`, `ingest/` and `notify/` are still skeletons, so
+there is **no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
+design + rationale: `codex/docs/echo.md`; service-scoped shape, the verified cross-service
+findings and the per-module decisions in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What it does
 
@@ -31,7 +32,8 @@ session-coordination.md). Mark/accent: **none yet** (generate via the constellat
 
 Python 3.12 + uv. Sources in `src/echo/` (`follow/`, `fetch/`, `ingest/`, `notify/` — the four
 pieces the design names); pytest suite in `tests/`. The channel-follow config schema is in
-`codex/docs/echo.md`.
+`codex/docs/echo.md`, and `follow/config.py` is its only reader — every other module gets
+already-resolved settings, so the YAML shape is known in exactly one place.
 
 ```bash
 uv sync                     # environment + lockfile
