@@ -1,37 +1,33 @@
 # Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
-
-# Virtualenv / uv
 .venv/
-.python-version
+dist/
+build/
+*.egg-info/
 
 # Tooling caches
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.pytest_cache/
-htmlcov/
-.coverage
 
-# Model weights (mounted from NAS or baked at build; never committed).
-# Root-anchored so it does NOT match the src/argus/models/ package.
-/models/
-*.onnx
-*.pth
-*.safetensors
-
-# Local env
-.env
-.env.*
-
-# OS / editor
-.DS_Store
+# IDE
 .idea/
 .vscode/
+
+# OS
+.DS_Store
+
+# Local env / secrets
+.env
+*.local
+
+# Coverage artifacts
+.coverage
+htmlcov/
+
+# Local env (broader than *.local — e.g. .env.production)
+.env.*
 
 # Claude local settings (commands + skills ARE tracked; local settings are not)
 .claude/settings.local.json

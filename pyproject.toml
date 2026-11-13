@@ -1,0 +1,42 @@
+[project]
+name = "echo-service"
+version = "0.1.0"
+description = "Echo — follows YouTube channels anonymously and feeds them to the constellation media pipeline"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Calvin Ference", email = "calvin.ference@proton.me" }]
+requires-python = ">=3.12"
+dependencies = [
+  "yt-dlp>=2025.1.15",  # the downloader; Echo is a thin wrapper around it
+  "httpx>=0.27",        # Hermes client (same floor as argus-tagger)
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/echo"]
+
+# ruff owns lint AND format (replaces black/flake8/isort).
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
