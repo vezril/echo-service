@@ -386,14 +386,44 @@ unimplementable at deploy time**, which means the anonymity property Echo is nam
 actually in place yet. This is a chart/infra item for the **Codex session**, not an Echo one —
 and it should be settled before Echo first runs against YouTube, not after.
 
+## Implementation — `state/` landed (2026-11-13)
+
+Echo's own store: **SQLite**, single writer, file on the NAS volume beside the downloads
+(`state/schema.py`, `state/store.py`). A fifth module beyond the four the canonical note names —
+recorded here as an addition, not a drift. A server-class database would add a dependency, a
+Secret and a backup story for a few thousand rows that only Echo writes.
+
+It holds exactly what the earlier decisions require: seen video ids (the feed is a ~15-entry
+window), the `handle → channel_id` resolution, the feed's conditional-GET validators, the
+**verbatim title** Artemis has no column for, and per-video queue/retry/error state for
+`echo-ui`.
+
+Decisions taken while building:
+
+- **"Seen" and "done" are separate.** `SEEN_STATES` = `downloaded | ingested | filtered` is what
+  `follow/` must not re-select; `deferred` and `failed` are deliberately **not** seen, because
+  they are owed another attempt. The two work queues (`due_for_fetch`, `due_for_ingest`) are
+  separate from both.
+- **Retry backoff is stored, not computed at read time** — 5m → 15m → 1h → 6h → 24h, capped, so
+  a broken extractor backs off instead of hammering an endpoint that is already refusing, and a
+  restart does not reset the schedule.
+- **A report for a video nobody recorded raises** rather than updating zero rows. Silently
+  no-oping would lose the outcome of a download that really happened.
+- **Re-recording a feed entry cannot walk a video backwards** (`ON CONFLICT` updates only title
+  and URL). The feed keeps showing a video Echo already downloaded; that must be inert.
+- **`first_synced_at` gates backfill**, so it applies to the first poll only and does not
+  re-trigger on restart.
+- **Timestamps are ISO-8601 UTC text.** SQLite has no date type; text keeps the file legible
+  from the `sqlite3` CLI when something needs explaining at 2am, and everything is read back
+  timezone-aware — a naive timestamp would compare wrong against the stale-nudge window.
+
 ### Still open, in the order they now block work
 
-1. **Echo's own datastore** — seen video ids, `handle → channel_id`, verbatim titles, backfill
-   position, and queue/retry/error state for `echo-ui`. Now the next piece: `follow/` takes
-   `seen` as a plain collection and returns what to record, and `fetch/` returns a
-   `FetchReport` whose `retryable` flag is exactly what the store must persist, so the schema
-   is evidence-based rather than guessed.
-2. **`ingest/`** — unblocked by the `source` decision above; needs the store for the title.
-3. **ProtonVPN egress** (above) — routed to the Codex session.
+1. **`ingest/`** — now the next piece. Unblocked: the `source` form is locked and the store
+   holds the title.
+2. **The worker loop + entry point** — `python -m echo` still exits 1. The poll cycle is
+   already assembled end-to-end in `tests/test_store.py::test_a_poll_cycle_is_idempotent`.
+3. **ProtonVPN egress** (above) — routed to the Codex session; should land before Echo first
+   runs against YouTube.
 4. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
    date. `notify/` designs against the `GET /pools/{id}/posts` fallback.

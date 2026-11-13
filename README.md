@@ -5,9 +5,9 @@ feeds them into the constellation's media pipeline for viewing in Artemis + noti
 piece of the de-google project.
 
 **Status:** IN PROGRESS (2026-11-13). `follow/` (config, feed polling, handle resolution,
-new-upload detection) and `fetch/` (metadata filters, yt-dlp options, probe-judge-download) are
-implemented. `ingest/` and `notify/` are still skeletons, and there is no datastore, so there is
-**no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
+new-upload detection), `fetch/` (metadata filters, yt-dlp options, probe-judge-download) and
+`state/` (Echo's SQLite store) are implemented. `ingest/` and `notify/` are still skeletons, so
+there is **no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
 design + rationale: `codex/docs/echo.md`; service-scoped shape, the verified cross-service
 findings and the per-module decisions in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -32,8 +32,8 @@ session-coordination.md). Mark/accent: **none yet** (generate via the constellat
 ## Build
 
 Python 3.12 + uv. Sources in `src/echo/` (`follow/`, `fetch/`, `ingest/`, `notify/` — the four
-pieces the design names); pytest suite in `tests/`. The channel-follow config schema is in
-`codex/docs/echo.md`, and `follow/config.py` is its only reader — every other module gets
+pieces the design names — plus `state/`, Echo's own SQLite store); pytest suite in `tests/`. The
+channel-follow config schema is in `codex/docs/echo.md`, and `follow/config.py` is its only reader — every other module gets
 already-resolved settings, so the YAML shape is known in exactly one place.
 
 ```bash
