@@ -5,17 +5,19 @@ feeds them into the constellation's media pipeline for viewing in Artemis + noti
 piece of the de-google project.
 
 **Status:** IN PROGRESS (2026-11-13). `follow/` (config, feed polling, handle resolution,
-new-upload detection), `fetch/` (metadata filters, yt-dlp options, probe-judge-download) and
-`state/` (Echo's SQLite store) are implemented. `ingest/` and `notify/` are still skeletons, so
-there is **no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
+new-upload detection), `fetch/` (metadata filters, yt-dlp options, probe-judge-download),
+`state/` (Echo's SQLite store) and `ingest/` (title→tags, the Artemis client, the hand-off) are
+implemented. `notify/` is still a skeleton and nothing wires the modules together, so there is
+**no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
 design + rationale: `codex/docs/echo.md`; service-scoped shape, the verified cross-service
 findings and the per-module decisions in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What it does
 
 Public per-channel RSS (no login / no API key) → filter → **yt-dlp** download (optional ProtonVPN
-egress) → hand off to **Apollo** (blob) and **Hephaestus** (poster + web transcode) → post to
-**Artemis** (channel → pool, uploader → artist-tag) → **Hermes** `video.ingested`. Retention is
+egress) → **Artemis** `POST /uploads`, which stores the blob in **Apollo** and has **Hephaestus**
+build the poster + web transcode (channel → pool, title → tags) → **Hermes** `video.ingested`.
+Echo talks to Artemis only — verified, see [docs/DESIGN.md](docs/DESIGN.md). Retention is
 **manual**; Echo assists with two notifications (available + stale/unwatched nudge).
 
 A thin **worker** — the Argus pattern: Python (yt-dlp is Python), chart lives in `codex`, rides

@@ -417,13 +417,93 @@ Decisions taken while building:
   from the `sqlite3` CLI when something needs explaining at 2am, and everything is read back
   timezone-aware — a naive timestamp would compare wrong against the stale-nudge window.
 
+## Implementation — `ingest/` landed (2026-11-13)
+
+Three pieces: `ingest/tags.py` (the tokenizer, pure), `ingest/artemis.py` (the HTTP client),
+`ingest/service.py` (the four-step hand-off). Verified against `artemis-service` at the
+file:line level before writing anything, and three of the design note's assumptions moved.
+
+### Topology correction — Echo talks to **Artemis only**
+
+`POST /uploads` streams the request body **to Apollo itself**, content-addressed, then seeds the
+post and publishes the `ProcessMediaJob` Hephaestus consumes (`http/UploadRoutes.scala:17-25`,
+`ingest/UploadService.scala:43-80`). So:
+
+- **No Apollo client in Echo.** This supersedes both the canonical note ("hand off to Apollo
+  (blob)") and §5 above, which still had Echo calling Apollo directly. Echo makes four HTTP
+  calls, all to Artemis.
+- No Hephaestus client either, as §5 already concluded.
+
+### Blocker — `source` cannot be set, so the join key is the **post id**
+
+The decision locked earlier today (join on `source`) **cannot be implemented against Artemis's
+API as it stands.** Verified:
+
+- `SetSource(source, at)` exists as a domain command (`domain/PostCommand.scala:72`) and
+  `UploadService.upload` takes a `source` parameter —
+- but **no HTTP route exposes it.** The post routes are `PATCH …/tags`, `POST/DELETE
+  …/favorite`, `POST …/score`, `PATCH …/rating`, `GET …` (`http/CatalogRoutes.scala:54-105`).
+  There is no `source` setter and `CreatePostRequest` is `{id, md5, filetype}`.
+- `UploadRoutes` calls `upload(dataBytes, contentType, mediaType)` — three arguments, so `tags`
+  and `source` take their empty defaults.
+- Worse, even passing them would not help a new video: `mergeMetadata` runs only on the
+  **dedup/restore** branches; `createFresh` applies neither. Artemis's own comment says so —
+  "the metadata-merge activates once the endpoint (or Muses) supplies tags/source."
+
+**Decision: Echo joins on the `post_id` returned by the upload**, which `state/` already stores.
+This needs no change in another repo and is a complete two-way join (Echo record → post, and
+post → Echo record by looking up `post_id`).
+
+What is lost: `source:<video_id>` lookups in the Artemis DSL. **Putting the video id in a tag is
+not a substitute and must not be done** — `Tag.normalize` lowercases, and YouTube ids are
+case-sensitive (`dQw4w9WgXcQ` → `dqw4w9wgxcq`), so it would be lossy and collision-prone.
+
+The `source` decision is not wasted: the form (bare video id) is still right, and sending it
+becomes one line once a seam exists. **Ask for the Artemis session**, small and well-scoped:
+pass `tags`/`source` through `POST /uploads` *and* apply them in `createFresh`. Not blocking.
+
+### Correction — "uploader → artist-tag" is not available to Echo
+
+`TagCategory.prefix` is a **search** namespace (`character:cat`), not part of a tag's name, and
+no route assigns a tag's category — `ChangeTags` carries names only. So the uploader lands as a
+**general** tag (`linus_tech_tips`). §4's note that "the category prefix is the mechanism" is
+wrong. Categorizing it later is an Artemis-side concern.
+
+### The tokenizer
+
+Matches `Tag.normalize` exactly (`domain/Tag.scala:33`), `MaxLength` 170. Drops stopwords and
+YouTube title boilerplate, pure numbers (an episode number or year tags nothing), single
+characters, and anything with no alphanumeric content (emoji, punctuation). Caps at 12 tags.
+Unicode letters are kept — a non-English channel's words are content. The uploader and
+`extra_tags` are normalized but **not** stopword-filtered: a channel called "The Why Files" must
+not lose two thirds of its name.
+
+### Every step is idempotent, so a partial failure needs no compensation
+
+Upload dedups on md5 (same bytes → same post), the tags PATCH is a full-set replace, pool create
+answers `409` (treated as success), and `AddPost` on a member is an explicit no-op in the pool
+aggregate (`PoolDomain.scala:34`). So `ingest/` reports failure and the next cycle retries from
+the top; the store marks a video ingested only on complete success.
+
+### Coordination finding — Artemis buffers the whole upload in memory
+
+`UploadService` does `bytes.runFold(ByteString.empty)(_ ++ _)` to compute the md5 before storing,
+commented "fine at personal scale". That was written for images. **Echo's uploads are 1080p
+videos — hundreds of MiB to several GiB each**, and that buffer is JVM heap. Echo streams from
+disk on its side, but the receiving end will hold the entire file in memory. This is likely to
+OOM Artemis on the first large video, and it is an Artemis-side change (stream to Apollo while
+hashing incrementally). **Route to the Artemis session — this one should land before Echo first
+ingests.**
+
 ### Still open, in the order they now block work
 
-1. **`ingest/`** — now the next piece. Unblocked: the `source` form is locked and the store
-   holds the title.
-2. **The worker loop + entry point** — `python -m echo` still exits 1. The poll cycle is
-   already assembled end-to-end in `tests/test_store.py::test_a_poll_cycle_is_idempotent`.
-3. **ProtonVPN egress** (above) — routed to the Codex session; should land before Echo first
-   runs against YouTube.
-4. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
+1. **`notify/`** — the last module. `video.ingested` over Hermes is unblocked; the stale nudge
+   is not (below).
+2. **The worker loop + entry point** — `python -m echo` still exits 1. Both halves of the cycle
+   are now assembled in tests (`test_store.py::test_a_poll_cycle_is_idempotent`,
+   `test_ingest_service.py`).
+3. **Artemis: the md5 buffering** (above) — the one item that can break Echo's first real run.
+4. **ProtonVPN egress** — Codex session; the anonymity property is not in place without it.
+5. **Artemis: `tags`/`source` on upload** (above) — would let Echo stamp `source` as decided.
+6. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
    date. `notify/` designs against the `GET /pools/{id}/posts` fallback.
