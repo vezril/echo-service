@@ -293,13 +293,107 @@ The per-channel Atom feed gives video id, title, watch URL, channel id, author, 
 
 Only `title_include` / `title_exclude` are decidable in `follow/`, and that is where they run.
 
+## Decision — `source` is the bare video id (Calvin, 2026-11-13)
+
+The canonical YouTube form Echo stamps on the Artemis post's `source`, and keys its own record
+by, is the **bare video id** (`dQw4w9WgXcQ`) — not the watch URL. Locked; `watch_url(video_id)`
+in `fetch/download.py` is the single place it is turned back into something openable.
+
+Why the id:
+
+- **`source` is exact-match only** in Artemis (`exactString("source", value)`), so the stored
+  form must never vary. A watch URL has many surface forms — `youtu.be/ID`, `m.youtube.com`,
+  `&t=`, `&list=`, `?si=` — and each variant is a silent lookup miss in both directions.
+- The id is what the feed hands over directly (`yt:videoId`), so there is no construction step
+  for a formatting bug to enter.
+- In the one place `source` is actually searchable — the Artemis DSL — `source:dQw4w9WgXcQ` is
+  typeable where a full URL is not.
+- **Verified, so the counter-argument is void:** `source` is *not* rendered as a link in the
+  gallery. `artemis-ui/src/components/catalog/post-view.tsx:111-118` puts it in a truncated
+  `<span class="truncate text-xs text-muted-foreground">`. A URL would buy no clickability,
+  only a longer truncated string.
+
+Cost, stated plainly: the id is opaque to a human reading the Details panel. Since the title
+already does not appear in the gallery (§ verbatim title), the `source` row is a video post's
+only identifier there — but it is non-link truncated text either way, so this changes nothing
+in practice. Full titles live in `echo-ui`.
+
+## Implementation — `fetch/` landed (2026-11-13)
+
+Three pieces, splitting the pure decisions from the one place that touches yt-dlp:
+
+| module | owns | pure |
+|---|---|---|
+| `fetch/filters.py` | duration bounds, Shorts, livestreams — the feed can't decide these | yes |
+| `fetch/options.py` | `ChannelSettings` → yt-dlp options | yes |
+| `fetch/download.py` | probe → judge → download → report; the only yt-dlp caller | no |
+
+Decisions taken while building:
+
+- **Two passes per video: probe (`skip_download`) then download.** The filters exist to avoid
+  spending bandwidth, so they must run against metadata *before* the download — and both passes
+  are built by the same function, so the probe cannot drift from the download it is judging.
+- **Three verdicts, not two: accept / reject / defer.** "Not yet" and "not ever" must not be
+  conflated. A reject is recorded as seen; a **defer never is**, or a livestream's finished
+  recording would be lost permanently.
+- **Failure is a reported outcome, not an exception.** `FetchReport.retryable` carries it. A
+  permanently-gone video (private, removed, members-only, terminated account) is terminal; an
+  unrecognised failure is retryable, because wrongly retrying costs a poll cycle while wrongly
+  giving up loses an upload. The classification is substring matching on `DownloadError` text —
+  unavoidable, since yt-dlp signals these through message text rather than distinct types — so
+  the marker list is deliberately conservative.
+- **Filenames are `<root>/<channel_id>/<video_id>.<ext>`, never the title.** Titles carry emoji,
+  slashes and 180 characters of clickbait; the verbatim title lives in Echo's state anyway. The
+  per-channel tree is also easy to exclude from backup, which `media-backup.md` argues for since
+  the content is re-fetchable.
+- **`overwrites: False` + `continuedl: True`** — a partial download resumes, a finished file is
+  never re-fetched or clobbered.
+- **`ignoreerrors: False`, `noplaylist: True`** — Echo decides what to retry, and a video
+  carrying a playlist parameter must not pull the playlist.
+- **Options are validated against the real yt-dlp** in `tests/test_options_against_ytdlp.py`
+  (offline). A renamed option or postprocessor key is the one failure a dict assertion cannot
+  see: every unit test would pass while nothing downloads.
+
+### Resolved ambiguity — `livestreams: skip` vs `after`
+
+The schema offers `skip | after | never`, but only two behaviours are distinguishable. Under the
+reading where each name means what it says in plain English — `skip` = pass on it for now,
+`after` = take it once it ends, `never` = never touch stream content — `skip` and `after` reach
+the same long-run outcome: defer while live, then treat the finished recording as an ordinary
+upload. Implemented that way, with `never` terminal for both the live event and the VOD.
+
+**For Calvin:** the schema could drop to two values (`never`, `after`) with `skip` kept as the
+default alias, or `skip` could be given a distinct meaning. Nothing is blocked either way.
+
+### Shorts detection is a heuristic — stated honestly
+
+YouTube exposes no reliable "is a Short" flag in extracted metadata. `is_short` uses the
+`/shorts/` URL path (conclusive, but rarely present — most extractions give `/watch?v=`) and,
+failing that, requires **both** a portrait frame and a duration ≤ 180s, so a 45-second landscape
+teaser is not mislabelled. The robust lever remains `filters.min_duration` (60s default), which
+is what the canonical note means by "kills most Shorts/teasers".
+
+### Blocker surfaced — no in-cluster ProtonVPN egress exists
+
+`proton_vpn: true` is the **default**, and nothing in the constellation implements it. Checked
+`codex/docs`, `codex/charts` and `codex/apps`: ProtonVPN appears only as a **device-level
+client** (`access-model.md:113`, "ProtonVPN coexistence note" — the operator's phone/laptop), and
+there is no egress gateway, sidecar or proxy anywhere in the charts.
+
+`fetch/` is not blocked: it takes a proxy URL from the caller (Secret-sourced, never from the
+config file) and simply runs without one when absent. But **the documented default is
+unimplementable at deploy time**, which means the anonymity property Echo is named for is not
+actually in place yet. This is a chart/infra item for the **Codex session**, not an Echo one —
+and it should be settled before Echo first runs against YouTube, not after.
+
 ### Still open, in the order they now block work
 
-1. **The canonical `source` form — bare video id or full watch URL.** Unchosen, and it is the
-   join key between the Artemis post and Echo's own record (§ titles→tags). **Blocks `ingest/`**
-   and should be decided before Echo's datastore is written, because the store keys on it.
-2. **Echo's own datastore** — seen video ids, `handle → channel_id`, verbatim titles, queue /
-   retry / error state for `echo-ui`. `follow/` currently takes `seen` as a plain collection and
-   returns what to record, so the store can land without reopening it.
-3. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
+1. **Echo's own datastore** — seen video ids, `handle → channel_id`, verbatim titles, backfill
+   position, and queue/retry/error state for `echo-ui`. Now the next piece: `follow/` takes
+   `seen` as a plain collection and returns what to record, and `fetch/` returns a
+   `FetchReport` whose `retryable` flag is exactly what the store must persist, so the schema
+   is evidence-based rather than guessed.
+2. **`ingest/`** — unblocked by the `source` decision above; needs the store for the title.
+3. **ProtonVPN egress** (above) — routed to the Codex session.
+4. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
    date. `notify/` designs against the `GET /pools/{id}/posts` fallback.

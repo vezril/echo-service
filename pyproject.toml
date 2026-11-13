@@ -40,5 +40,11 @@ strict = true
 files = ["src"]
 mypy_path = "src"
 
+# yt-dlp ships no py.typed and has no stubs. The untyped surface is confined to
+# echo.fetch.download, which wraps it behind the typed Downloader protocol.
+[[tool.mypy.overrides]]
+module = ["yt_dlp.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

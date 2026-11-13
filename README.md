@@ -4,9 +4,10 @@ Echo follows YouTube channels **without a Google account**, downloads new upload
 feeds them into the constellation's media pipeline for viewing in Artemis + notifications. The last
 piece of the de-google project.
 
-**Status:** IN PROGRESS (2026-11-13). `follow/` is implemented — config, feed polling, handle
-resolution and new-upload detection. `fetch/`, `ingest/` and `notify/` are still skeletons, so
-there is **no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
+**Status:** IN PROGRESS (2026-11-13). `follow/` (config, feed polling, handle resolution,
+new-upload detection) and `fetch/` (metadata filters, yt-dlp options, probe-judge-download) are
+implemented. `ingest/` and `notify/` are still skeletons, and there is no datastore, so there is
+**no worker loop yet** and `python -m echo` still exits non-zero by design. Canonical
 design + rationale: `codex/docs/echo.md`; service-scoped shape, the verified cross-service
 findings and the per-module decisions in [docs/DESIGN.md](docs/DESIGN.md).
 
