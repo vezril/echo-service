@@ -250,6 +250,17 @@ class EchoStore:
             return FeedValidators()
         return FeedValidators(etag=row["etag"], last_modified=row["last_modified"])
 
+    def last_polled_at(self, channel_id: str) -> datetime | None:
+        """When this channel was last polled, or ``None`` if it never was.
+
+        The worker compares this against ``poll_interval`` to decide whether a channel is due,
+        so the interval survives a restart instead of every start polling everything.
+        """
+        row = self._connection.execute(
+            "SELECT last_polled_at FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        return _parse(row["last_polled_at"]) if row else None
+
     # --- videos -----------------------------------------------------------------------
 
     def seen_video_ids(self, channel_id: str) -> frozenset[str]:

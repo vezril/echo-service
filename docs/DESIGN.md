@@ -550,15 +550,64 @@ day Artemis exposes a viewed flag this lights up by injecting an implementation.
 
 Echo still deletes nothing — `stale_after` drives only the notification.
 
+## Implementation — the worker loop and entry point (2026-11-16)
+
+`worker.py` plus `settings.py` and a real `__main__.py`. Echo is now feature-complete.
+
+One cycle, per enabled channel: resolve (once ever) → poll if `poll_interval` has elapsed →
+fetch what the store says is due → ingest → notify. Three properties it is built around:
+
+- **Work is driven by the store, not by what the cycle discovers.** The fetch step asks the
+  store what is owed, so a video deferred two cycles ago is picked up without the feed
+  mentioning it again, and a crash mid-cycle loses nothing.
+- **One bad channel cannot stop the others.** Every channel is isolated; the cycle counts the
+  failure and moves on. A worker that dies because one handle 404s is useless.
+- **One clock per cycle.** Every store write records the cycle's `now` rather than reading the
+  wall clock again — otherwise the poll interval and the retry backoff drift against each other
+  mid-cycle. (A test caught this; the first version passed `now` to the *decisions* but not to
+  the *writes*.)
+
+Batching is per channel per cycle (3 downloads, 5 ingests) so one channel's backlog cannot
+starve the others and a cycle stays bounded.
+
+### Decision — a channel wanting ProtonVPN with no proxy configured is **skipped**
+
+`proton_vpn: true` is the default, and the cluster has no egress (above). Downloading anyway
+would show YouTube the home IP, which is the single thing Echo exists to prevent, so the worker
+**skips such a channel entirely — poll included** — and logs what to do about it. The operator
+chooses explicitly: set `ECHO_PROXY_URL`, set `proton_vpn: false` for that channel, or set
+`ECHO_ALLOW_UNPROXIED=true` to accept the leak. Nothing silently leaks.
+
+### Config vs environment
+
+The YAML holds *what to follow and how* and stays safe to commit and to edit in `echo-ui`. The
+environment holds *where things are and how to authenticate* — URLs, paths, tokens, the egress
+proxy. `RuntimeSettings` **redacts its secrets in `repr` and `str`** while still reporting
+whether each is set: a settings object reaches a traceback or a log line eventually, and a proxy
+URL with embedded credentials would then live in a log aggregator forever.
+
+Exit codes are for a supervisor: `0` clean, `1` the worker failed, `2` the config or environment
+is wrong. The difference matters — a `2` will never come right without a human.
+
+### Not yet run against anything real
+
+Every test fakes the network edge, which is how the failure paths get covered at all, but it
+means **no part of Echo has ever talked to YouTube, Artemis or Hermes.** The feed parser was
+written against the documented Atom shape, not a live response. A live feed poll is read-only
+and account-free, but it would send traffic from the home IP — exactly the property the egress
+gap leaves broken — so it is deliberately left for Calvin to authorize.
+
 ### Still open, in the order they now block work
 
-1. **The worker loop + entry point** — the only remaining Echo-side work. All four modules plus
-   the store exist; nothing wires them into a poll cycle, and `python -m echo` still exits 1.
-   Both halves are already assembled in tests
-   (`test_store.py::test_a_poll_cycle_is_idempotent`, `test_ingest_service.py`).
-2. **Artemis: the md5 buffering** — the one item that can break Echo's first real run.
-3. **ProtonVPN egress** — Codex session; the anonymity property is not in place without it.
-4. **Artemis: `tags`/`source` on upload** — would let Echo stamp `source` as decided.
-5. **Lexicon: a `video.ingested` message** — when a consumer exists.
-6. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
+1. **Artemis: the md5 buffering** — the one item that can break Echo's first real run.
+2. **ProtonVPN egress** — Codex session. Without it, every default-configured channel is
+   skipped by design, so Echo does nothing until this or an explicit opt-out lands.
+3. **A live smoke test** — one feed poll, then one end-to-end video, both needing Calvin's go.
+4. **Deployment** — chart in `codex/charts/echo` per the worker pattern, plus the `ECHO_*`
+   environment and the Secret. The Codex session's tree.
+5. **Artemis: `tags`/`source` on upload** — would let Echo stamp `source` as decided.
+6. **Lexicon: a `video.ingested` message** — when a consumer exists.
+7. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
    date. The nudge stays suppressed until watched-state lands.
+8. `echo-ui` — the store already holds everything it needs (queue, retry, error state, verbatim
+   titles).
