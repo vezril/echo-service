@@ -241,3 +241,373 @@ index rejected in §4. Deferred deliberately: don't spend another repo's budget 
 question before Calvin has actually browsed video posts in the gallery and formed an opinion.
 
 `ingest/` is unblocked.
+
+## Implementation — `follow/` landed (2026-11-13)
+
+First behaviour in the repo. `follow/` is four pieces, split so that every decision with a
+consequence is a pure function and only two of them touch the network:
+
+| module | owns | network |
+|---|---|---|
+| `follow/config.py` | parse / deep-merge / validate the channel-follow file | no |
+| `follow/feed.py` | the Atom parser (pure) + a conditional-GET `FeedClient` | yes |
+| `follow/resolve.py` | `handle`/`url` → `channel_id`, once per channel | yes |
+| `follow/detect.py` | which entries are new; what backfill does on first sync | no |
+
+Decisions taken while building, none of which contradict the canonical note:
+
+- **Config rejects unknown keys** rather than ignoring them. A silently-dropped `max_hieght`
+  looks like a working config that quietly downloads 4K forever, and this file is hand-edited.
+- **`yaml.safe_load` only** — the file is hand-edited, so `yaml.load` would make it a
+  code-execution path. Covered by a test.
+- **Deep-merge recurses only into the documented nested blocks**; lists replace wholesale, so
+  an inherited `extra_tags` can be overridden *down* rather than only appended to.
+- **Title-filtered and backfill-skipped entries are recorded as seen, not dropped.** Without
+  that, every poll re-evaluates the same rejects forever, and an older entry still inside the
+  feed window gets re-fetched.
+- **Resolution is restricted to youtube.com hosts** (and re-checked after redirects). The URL
+  comes from a config file; a fetcher that follows any URL a file names is a request-forgery
+  lever pointed at whatever the worker can reach on the cluster network.
+- **Responses are read under a size cap, streamed** — remote input, so an unbounded read is a
+  memory lever held by whatever answers the URL.
+- **Conditional GET** (`If-None-Match` / `If-Modified-Since`). Polling someone else's free
+  endpoint every 30 minutes forever should usually cost them a 304, which also makes a tighter
+  `poll_interval` cheap. Callers must persist the returned `etag` / `last_modified`.
+
+### Verified: what the feed does NOT carry (constrains `fetch/`)
+
+The per-channel Atom feed gives video id, title, watch URL, channel id, author, `published`,
+`updated`, a thumbnail URL and a description. It does **not** give:
+
+- **duration** — so `filters.min_duration` / `max_duration` *cannot* be applied before the
+  download decision at feed level. They belong to `fetch/`, against yt-dlp's extracted
+  metadata (`--match-filter`), not to `follow/`.
+- **a Shorts flag or a livestream flag** — so `shorts` and `livestreams` are likewise `fetch/`
+  decisions. A Short is an ordinary entry; the common proxy is the duration bound, which is
+  why `min_duration: 60s` is the default.
+- **history** — the feed is a **window of roughly 15 entries, newest first**. Two consequences:
+  a channel that uploads faster than Echo polls will drop uploads off the end before they are
+  ever seen (that is what `poll_interval` is really tuning), and **`backfill` can never reach
+  further back than the window**, whatever number the config names. `backfill: 50` on a
+  long-running channel yields ~15, not 50.
+
+Only `title_include` / `title_exclude` are decidable in `follow/`, and that is where they run.
+
+## Decision — `source` is the bare video id (Calvin, 2026-11-13)
+
+The canonical YouTube form Echo stamps on the Artemis post's `source`, and keys its own record
+by, is the **bare video id** (`dQw4w9WgXcQ`) — not the watch URL. Locked; `watch_url(video_id)`
+in `fetch/download.py` is the single place it is turned back into something openable.
+
+Why the id:
+
+- **`source` is exact-match only** in Artemis (`exactString("source", value)`), so the stored
+  form must never vary. A watch URL has many surface forms — `youtu.be/ID`, `m.youtube.com`,
+  `&t=`, `&list=`, `?si=` — and each variant is a silent lookup miss in both directions.
+- The id is what the feed hands over directly (`yt:videoId`), so there is no construction step
+  for a formatting bug to enter.
+- In the one place `source` is actually searchable — the Artemis DSL — `source:dQw4w9WgXcQ` is
+  typeable where a full URL is not.
+- **Verified, so the counter-argument is void:** `source` is *not* rendered as a link in the
+  gallery. `artemis-ui/src/components/catalog/post-view.tsx:111-118` puts it in a truncated
+  `<span class="truncate text-xs text-muted-foreground">`. A URL would buy no clickability,
+  only a longer truncated string.
+
+Cost, stated plainly: the id is opaque to a human reading the Details panel. Since the title
+already does not appear in the gallery (§ verbatim title), the `source` row is a video post's
+only identifier there — but it is non-link truncated text either way, so this changes nothing
+in practice. Full titles live in `echo-ui`.
+
+## Implementation — `fetch/` landed (2026-11-13)
+
+Three pieces, splitting the pure decisions from the one place that touches yt-dlp:
+
+| module | owns | pure |
+|---|---|---|
+| `fetch/filters.py` | duration bounds, Shorts, livestreams — the feed can't decide these | yes |
+| `fetch/options.py` | `ChannelSettings` → yt-dlp options | yes |
+| `fetch/download.py` | probe → judge → download → report; the only yt-dlp caller | no |
+
+Decisions taken while building:
+
+- **Two passes per video: probe (`skip_download`) then download.** The filters exist to avoid
+  spending bandwidth, so they must run against metadata *before* the download — and both passes
+  are built by the same function, so the probe cannot drift from the download it is judging.
+- **Three verdicts, not two: accept / reject / defer.** "Not yet" and "not ever" must not be
+  conflated. A reject is recorded as seen; a **defer never is**, or a livestream's finished
+  recording would be lost permanently.
+- **Failure is a reported outcome, not an exception.** `FetchReport.retryable` carries it. A
+  permanently-gone video (private, removed, members-only, terminated account) is terminal; an
+  unrecognised failure is retryable, because wrongly retrying costs a poll cycle while wrongly
+  giving up loses an upload. The classification is substring matching on `DownloadError` text —
+  unavoidable, since yt-dlp signals these through message text rather than distinct types — so
+  the marker list is deliberately conservative.
+- **Filenames are `<root>/<channel_id>/<video_id>.<ext>`, never the title.** Titles carry emoji,
+  slashes and 180 characters of clickbait; the verbatim title lives in Echo's state anyway. The
+  per-channel tree is also easy to exclude from backup, which `media-backup.md` argues for since
+  the content is re-fetchable.
+- **`overwrites: False` + `continuedl: True`** — a partial download resumes, a finished file is
+  never re-fetched or clobbered.
+- **`ignoreerrors: False`, `noplaylist: True`** — Echo decides what to retry, and a video
+  carrying a playlist parameter must not pull the playlist.
+- **Options are validated against the real yt-dlp** in `tests/test_options_against_ytdlp.py`
+  (offline). A renamed option or postprocessor key is the one failure a dict assertion cannot
+  see: every unit test would pass while nothing downloads.
+
+### Resolved ambiguity — `livestreams: skip` vs `after`
+
+The schema offers `skip | after | never`, but only two behaviours are distinguishable. Under the
+reading where each name means what it says in plain English — `skip` = pass on it for now,
+`after` = take it once it ends, `never` = never touch stream content — `skip` and `after` reach
+the same long-run outcome: defer while live, then treat the finished recording as an ordinary
+upload. Implemented that way, with `never` terminal for both the live event and the VOD.
+
+**For Calvin:** the schema could drop to two values (`never`, `after`) with `skip` kept as the
+default alias, or `skip` could be given a distinct meaning. Nothing is blocked either way.
+
+### Shorts detection is a heuristic — stated honestly
+
+YouTube exposes no reliable "is a Short" flag in extracted metadata. `is_short` uses the
+`/shorts/` URL path (conclusive, but rarely present — most extractions give `/watch?v=`) and,
+failing that, requires **both** a portrait frame and a duration ≤ 180s, so a 45-second landscape
+teaser is not mislabelled. The robust lever remains `filters.min_duration` (60s default), which
+is what the canonical note means by "kills most Shorts/teasers".
+
+### Blocker surfaced — no in-cluster ProtonVPN egress exists
+
+`proton_vpn: true` is the **default**, and nothing in the constellation implements it. Checked
+`codex/docs`, `codex/charts` and `codex/apps`: ProtonVPN appears only as a **device-level
+client** (`access-model.md:113`, "ProtonVPN coexistence note" — the operator's phone/laptop), and
+there is no egress gateway, sidecar or proxy anywhere in the charts.
+
+`fetch/` is not blocked: it takes a proxy URL from the caller (Secret-sourced, never from the
+config file) and simply runs without one when absent. But **the documented default is
+unimplementable at deploy time**, which means the anonymity property Echo is named for is not
+actually in place yet. This is a chart/infra item for the **Codex session**, not an Echo one —
+and it should be settled before Echo first runs against YouTube, not after.
+
+## Implementation — `state/` landed (2026-11-13)
+
+Echo's own store: **SQLite**, single writer, file on the NAS volume beside the downloads
+(`state/schema.py`, `state/store.py`). A fifth module beyond the four the canonical note names —
+recorded here as an addition, not a drift. A server-class database would add a dependency, a
+Secret and a backup story for a few thousand rows that only Echo writes.
+
+It holds exactly what the earlier decisions require: seen video ids (the feed is a ~15-entry
+window), the `handle → channel_id` resolution, the feed's conditional-GET validators, the
+**verbatim title** Artemis has no column for, and per-video queue/retry/error state for
+`echo-ui`.
+
+Decisions taken while building:
+
+- **"Seen" and "done" are separate.** `SEEN_STATES` = `downloaded | ingested | filtered` is what
+  `follow/` must not re-select; `deferred` and `failed` are deliberately **not** seen, because
+  they are owed another attempt. The two work queues (`due_for_fetch`, `due_for_ingest`) are
+  separate from both.
+- **Retry backoff is stored, not computed at read time** — 5m → 15m → 1h → 6h → 24h, capped, so
+  a broken extractor backs off instead of hammering an endpoint that is already refusing, and a
+  restart does not reset the schedule.
+- **A report for a video nobody recorded raises** rather than updating zero rows. Silently
+  no-oping would lose the outcome of a download that really happened.
+- **Re-recording a feed entry cannot walk a video backwards** (`ON CONFLICT` updates only title
+  and URL). The feed keeps showing a video Echo already downloaded; that must be inert.
+- **`first_synced_at` gates backfill**, so it applies to the first poll only and does not
+  re-trigger on restart.
+- **Timestamps are ISO-8601 UTC text.** SQLite has no date type; text keeps the file legible
+  from the `sqlite3` CLI when something needs explaining at 2am, and everything is read back
+  timezone-aware — a naive timestamp would compare wrong against the stale-nudge window.
+
+## Implementation — `ingest/` landed (2026-11-13)
+
+Three pieces: `ingest/tags.py` (the tokenizer, pure), `ingest/artemis.py` (the HTTP client),
+`ingest/service.py` (the four-step hand-off). Verified against `artemis-service` at the
+file:line level before writing anything, and three of the design note's assumptions moved.
+
+### Topology correction — Echo talks to **Artemis only**
+
+`POST /uploads` streams the request body **to Apollo itself**, content-addressed, then seeds the
+post and publishes the `ProcessMediaJob` Hephaestus consumes (`http/UploadRoutes.scala:17-25`,
+`ingest/UploadService.scala:43-80`). So:
+
+- **No Apollo client in Echo.** This supersedes both the canonical note ("hand off to Apollo
+  (blob)") and §5 above, which still had Echo calling Apollo directly. Echo makes four HTTP
+  calls, all to Artemis.
+- No Hephaestus client either, as §5 already concluded.
+
+### Blocker — `source` cannot be set, so the join key is the **post id**
+
+The decision locked earlier today (join on `source`) **cannot be implemented against Artemis's
+API as it stands.** Verified:
+
+- `SetSource(source, at)` exists as a domain command (`domain/PostCommand.scala:72`) and
+  `UploadService.upload` takes a `source` parameter —
+- but **no HTTP route exposes it.** The post routes are `PATCH …/tags`, `POST/DELETE
+  …/favorite`, `POST …/score`, `PATCH …/rating`, `GET …` (`http/CatalogRoutes.scala:54-105`).
+  There is no `source` setter and `CreatePostRequest` is `{id, md5, filetype}`.
+- `UploadRoutes` calls `upload(dataBytes, contentType, mediaType)` — three arguments, so `tags`
+  and `source` take their empty defaults.
+- Worse, even passing them would not help a new video: `mergeMetadata` runs only on the
+  **dedup/restore** branches; `createFresh` applies neither. Artemis's own comment says so —
+  "the metadata-merge activates once the endpoint (or Muses) supplies tags/source."
+
+**Decision: Echo joins on the `post_id` returned by the upload**, which `state/` already stores.
+This needs no change in another repo and is a complete two-way join (Echo record → post, and
+post → Echo record by looking up `post_id`).
+
+What is lost: `source:<video_id>` lookups in the Artemis DSL. **Putting the video id in a tag is
+not a substitute and must not be done** — `Tag.normalize` lowercases, and YouTube ids are
+case-sensitive (`dQw4w9WgXcQ` → `dqw4w9wgxcq`), so it would be lossy and collision-prone.
+
+The `source` decision is not wasted: the form (bare video id) is still right, and sending it
+becomes one line once a seam exists. **Ask for the Artemis session**, small and well-scoped:
+pass `tags`/`source` through `POST /uploads` *and* apply them in `createFresh`. Not blocking.
+
+### Correction — "uploader → artist-tag" is not available to Echo
+
+`TagCategory.prefix` is a **search** namespace (`character:cat`), not part of a tag's name, and
+no route assigns a tag's category — `ChangeTags` carries names only. So the uploader lands as a
+**general** tag (`linus_tech_tips`). §4's note that "the category prefix is the mechanism" is
+wrong. Categorizing it later is an Artemis-side concern.
+
+### The tokenizer
+
+Matches `Tag.normalize` exactly (`domain/Tag.scala:33`), `MaxLength` 170. Drops stopwords and
+YouTube title boilerplate, pure numbers (an episode number or year tags nothing), single
+characters, and anything with no alphanumeric content (emoji, punctuation). Caps at 12 tags.
+Unicode letters are kept — a non-English channel's words are content. The uploader and
+`extra_tags` are normalized but **not** stopword-filtered: a channel called "The Why Files" must
+not lose two thirds of its name.
+
+### Every step is idempotent, so a partial failure needs no compensation
+
+Upload dedups on md5 (same bytes → same post), the tags PATCH is a full-set replace, pool create
+answers `409` (treated as success), and `AddPost` on a member is an explicit no-op in the pool
+aggregate (`PoolDomain.scala:34`). So `ingest/` reports failure and the next cycle retries from
+the top; the store marks a video ingested only on complete success.
+
+### Coordination finding — Artemis buffers the whole upload in memory
+
+`UploadService` does `bytes.runFold(ByteString.empty)(_ ++ _)` to compute the md5 before storing,
+commented "fine at personal scale". That was written for images. **Echo's uploads are 1080p
+videos — hundreds of MiB to several GiB each**, and that buffer is JVM heap. Echo streams from
+disk on its side, but the receiving end will hold the entire file in memory. This is likely to
+OOM Artemis on the first large video, and it is an Artemis-side change (stream to Apollo while
+hashing incrementally). **Route to the Artemis session — this one should land before Echo first
+ingests.**
+
+## Implementation — `notify/` landed (2026-11-16)
+
+The last of the four modules. `notify/hermes.py` (broker client), `notify/events.py` (the two
+payloads), `notify/service.py` (when to emit, when to stay quiet). Verified against `hermesmq`
+and `the-lexicon` first.
+
+### The Hermes contract, as verified
+
+- `POST /v1/topics` — `{topicId, labels}` → `201`, `409` when it exists (treated as success).
+  Needs the `admin` scope **if** broker auth is on; it is off by default.
+- `POST /v1/topics/{id}/messages` — `{payload, attributes, ttlSeconds, idempotencyKey,
+  producerId}` → `202 {messageId, deduplicated}`; `404` missing topic, `400` bad body, `503`
+  when the broker cannot accept (`http/PubSubRoutes.scala:95-115`).
+- **`payload` is a plain UTF-8 string, not base64** — `req.payload.getBytes(UTF_8)`
+  (`PubSubRoutes.scala:242`). JSON text goes straight in.
+- **The correlation id rides the `X-Correlation-Id` header, not the body.** REST has no
+  `correlationId` field; the route adopts the header and never mints one. Header name taken
+  from the lexicon's `codex.correlation` (`HTTP_HEADER`), the constellation's single source.
+- **Topic naming** follows the existing dotted-lowercase convention (`media.process`,
+  `media.tag`, `media.reprocess` in Artemis's `application.conf`): `video.ingested` and
+  `video.stale`.
+
+### Gap — the payloads are **not** Lexicon-defined
+
+`the-lexicon` is the constellation's single source for wire contracts, generating stubs for
+Scala *and* Python so producer/consumer mismatches are build errors
+(`codex.messages.v1`: `ProcessMediaJob`, `MediaProcessed`, `TagJob`…). There is **no
+`video.ingested` message there**, and adding one is a change to that repo behind its own
+`buf lint` / `buf breaking` gates and release process — not Echo's tree.
+
+Echo therefore publishes JSON it defines in `notify/events.py`, deliberately shaped so
+promoting it is rename-free: snake_case fields, flat scalars, `duration_seconds`, RFC 3339 UTC
+timestamps, an explicit `event` discriminator. **Nothing consumes these yet** (Hera / the Mentor
+brief are the intended readers), which is what makes this acceptable for now — the first
+consumer is also the moment the contract has to become real. **Ask for the Lexicon when a
+consumer appears.**
+
+### The stale nudge is built but deliberately silent
+
+Watched-state is a **port** (`WatchedState`), not an assumption, and its only implementation
+today is `UnknownWatchedState`, which answers "I cannot tell". When it cannot tell, the nudge is
+**suppressed rather than guessed**: a notification saying "4 videos you haven't watched" about
+videos already watched is worse than no notification — it teaches the reader to ignore it.
+
+The window arithmetic, the per-channel aggregation and the payload are built and tested, so the
+day Artemis exposes a viewed flag this lights up by injecting an implementation. Two notes:
+
+- Staleness is measured from a record's `updated_at`, which for an `ingested` row is when it
+  became ingested — nothing touches the row afterwards.
+- **The nudge keeps no state.** Its idempotency key is `video.stale:<channel>:<UTC date>`, so a
+  worker loop running every 30 minutes cannot nudge 48 times about one backlog. How often the
+  nudge is *attempted* is the loop's cadence to decide; this is the floor.
+
+Echo still deletes nothing — `stale_after` drives only the notification.
+
+## Implementation — the worker loop and entry point (2026-11-16)
+
+`worker.py` plus `settings.py` and a real `__main__.py`. Echo is now feature-complete.
+
+One cycle, per enabled channel: resolve (once ever) → poll if `poll_interval` has elapsed →
+fetch what the store says is due → ingest → notify. Three properties it is built around:
+
+- **Work is driven by the store, not by what the cycle discovers.** The fetch step asks the
+  store what is owed, so a video deferred two cycles ago is picked up without the feed
+  mentioning it again, and a crash mid-cycle loses nothing.
+- **One bad channel cannot stop the others.** Every channel is isolated; the cycle counts the
+  failure and moves on. A worker that dies because one handle 404s is useless.
+- **One clock per cycle.** Every store write records the cycle's `now` rather than reading the
+  wall clock again — otherwise the poll interval and the retry backoff drift against each other
+  mid-cycle. (A test caught this; the first version passed `now` to the *decisions* but not to
+  the *writes*.)
+
+Batching is per channel per cycle (3 downloads, 5 ingests) so one channel's backlog cannot
+starve the others and a cycle stays bounded.
+
+### Decision — a channel wanting ProtonVPN with no proxy configured is **skipped**
+
+`proton_vpn: true` is the default, and the cluster has no egress (above). Downloading anyway
+would show YouTube the home IP, which is the single thing Echo exists to prevent, so the worker
+**skips such a channel entirely — poll included** — and logs what to do about it. The operator
+chooses explicitly: set `ECHO_PROXY_URL`, set `proton_vpn: false` for that channel, or set
+`ECHO_ALLOW_UNPROXIED=true` to accept the leak. Nothing silently leaks.
+
+### Config vs environment
+
+The YAML holds *what to follow and how* and stays safe to commit and to edit in `echo-ui`. The
+environment holds *where things are and how to authenticate* — URLs, paths, tokens, the egress
+proxy. `RuntimeSettings` **redacts its secrets in `repr` and `str`** while still reporting
+whether each is set: a settings object reaches a traceback or a log line eventually, and a proxy
+URL with embedded credentials would then live in a log aggregator forever.
+
+Exit codes are for a supervisor: `0` clean, `1` the worker failed, `2` the config or environment
+is wrong. The difference matters — a `2` will never come right without a human.
+
+### Not yet run against anything real
+
+Every test fakes the network edge, which is how the failure paths get covered at all, but it
+means **no part of Echo has ever talked to YouTube, Artemis or Hermes.** The feed parser was
+written against the documented Atom shape, not a live response. A live feed poll is read-only
+and account-free, but it would send traffic from the home IP — exactly the property the egress
+gap leaves broken — so it is deliberately left for Calvin to authorize.
+
+### Still open, in the order they now block work
+
+1. **Artemis: the md5 buffering** — the one item that can break Echo's first real run.
+2. **ProtonVPN egress** — Codex session. Without it, every default-configured channel is
+   skipped by design, so Echo does nothing until this or an explicit opt-out lands.
+3. **A live smoke test** — one feed poll, then one end-to-end video, both needing Calvin's go.
+4. **Deployment** — chart in `codex/charts/echo` per the worker pattern, plus the `ECHO_*`
+   environment and the Secret. The Codex session's tree.
+5. **Artemis: `tags`/`source` on upload** — would let Echo stamp `source` as decided.
+6. **Lexicon: a `video.ingested` message** — when a consumer exists.
+7. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
+   date. The nudge stays suppressed until watched-state lands.
+8. `echo-ui` — the store already holds everything it needs (queue, retry, error state, verbatim
+   titles).

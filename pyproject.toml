@@ -8,7 +8,8 @@ authors = [{ name = "Calvin Ference", email = "calvin.ference@proton.me" }]
 requires-python = ">=3.12"
 dependencies = [
   "yt-dlp>=2025.1.15",  # the downloader; Echo is a thin wrapper around it
-  "httpx>=0.27",        # Hermes client (same floor as argus-tagger)
+  "httpx>=0.27",        # Hermes client (same floor as argus-tagger); also the feed poller
+  "pyyaml>=6.0",        # the channel-follow config file (safe_load only)
 ]
 
 [dependency-groups]
@@ -16,6 +17,7 @@ dev = [
   "ruff>=0.8",
   "mypy>=1.13",
   "pytest>=8",
+  "types-pyyaml>=6.0",  # pyyaml ships no inline types; mypy runs strict
 ]
 
 [build-system]
@@ -37,6 +39,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 strict = true
 files = ["src"]
 mypy_path = "src"
+
+# yt-dlp ships no py.typed and has no stubs. The untyped surface is confined to
+# echo.fetch.download, which wraps it behind the typed Downloader protocol.
+[[tool.mypy.overrides]]
+module = ["yt_dlp.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
