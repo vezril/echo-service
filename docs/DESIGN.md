@@ -495,15 +495,70 @@ OOM Artemis on the first large video, and it is an Artemis-side change (stream t
 hashing incrementally). **Route to the Artemis session — this one should land before Echo first
 ingests.**
 
+## Implementation — `notify/` landed (2026-11-16)
+
+The last of the four modules. `notify/hermes.py` (broker client), `notify/events.py` (the two
+payloads), `notify/service.py` (when to emit, when to stay quiet). Verified against `hermesmq`
+and `the-lexicon` first.
+
+### The Hermes contract, as verified
+
+- `POST /v1/topics` — `{topicId, labels}` → `201`, `409` when it exists (treated as success).
+  Needs the `admin` scope **if** broker auth is on; it is off by default.
+- `POST /v1/topics/{id}/messages` — `{payload, attributes, ttlSeconds, idempotencyKey,
+  producerId}` → `202 {messageId, deduplicated}`; `404` missing topic, `400` bad body, `503`
+  when the broker cannot accept (`http/PubSubRoutes.scala:95-115`).
+- **`payload` is a plain UTF-8 string, not base64** — `req.payload.getBytes(UTF_8)`
+  (`PubSubRoutes.scala:242`). JSON text goes straight in.
+- **The correlation id rides the `X-Correlation-Id` header, not the body.** REST has no
+  `correlationId` field; the route adopts the header and never mints one. Header name taken
+  from the lexicon's `codex.correlation` (`HTTP_HEADER`), the constellation's single source.
+- **Topic naming** follows the existing dotted-lowercase convention (`media.process`,
+  `media.tag`, `media.reprocess` in Artemis's `application.conf`): `video.ingested` and
+  `video.stale`.
+
+### Gap — the payloads are **not** Lexicon-defined
+
+`the-lexicon` is the constellation's single source for wire contracts, generating stubs for
+Scala *and* Python so producer/consumer mismatches are build errors
+(`codex.messages.v1`: `ProcessMediaJob`, `MediaProcessed`, `TagJob`…). There is **no
+`video.ingested` message there**, and adding one is a change to that repo behind its own
+`buf lint` / `buf breaking` gates and release process — not Echo's tree.
+
+Echo therefore publishes JSON it defines in `notify/events.py`, deliberately shaped so
+promoting it is rename-free: snake_case fields, flat scalars, `duration_seconds`, RFC 3339 UTC
+timestamps, an explicit `event` discriminator. **Nothing consumes these yet** (Hera / the Mentor
+brief are the intended readers), which is what makes this acceptable for now — the first
+consumer is also the moment the contract has to become real. **Ask for the Lexicon when a
+consumer appears.**
+
+### The stale nudge is built but deliberately silent
+
+Watched-state is a **port** (`WatchedState`), not an assumption, and its only implementation
+today is `UnknownWatchedState`, which answers "I cannot tell". When it cannot tell, the nudge is
+**suppressed rather than guessed**: a notification saying "4 videos you haven't watched" about
+videos already watched is worse than no notification — it teaches the reader to ignore it.
+
+The window arithmetic, the per-channel aggregation and the payload are built and tested, so the
+day Artemis exposes a viewed flag this lights up by injecting an implementation. Two notes:
+
+- Staleness is measured from a record's `updated_at`, which for an `ingested` row is when it
+  became ingested — nothing touches the row afterwards.
+- **The nudge keeps no state.** Its idempotency key is `video.stale:<channel>:<UTC date>`, so a
+  worker loop running every 30 minutes cannot nudge 48 times about one backlog. How often the
+  nudge is *attempted* is the loop's cadence to decide; this is the floor.
+
+Echo still deletes nothing — `stale_after` drives only the notification.
+
 ### Still open, in the order they now block work
 
-1. **`notify/`** — the last module. `video.ingested` over Hermes is unblocked; the stale nudge
-   is not (below).
-2. **The worker loop + entry point** — `python -m echo` still exits 1. Both halves of the cycle
-   are now assembled in tests (`test_store.py::test_a_poll_cycle_is_idempotent`,
-   `test_ingest_service.py`).
-3. **Artemis: the md5 buffering** (above) — the one item that can break Echo's first real run.
-4. **ProtonVPN egress** — Codex session; the anonymity property is not in place without it.
-5. **Artemis: `tags`/`source` on upload** (above) — would let Echo stamp `source` as decided.
+1. **The worker loop + entry point** — the only remaining Echo-side work. All four modules plus
+   the store exist; nothing wires them into a poll cycle, and `python -m echo` still exits 1.
+   Both halves are already assembled in tests
+   (`test_store.py::test_a_poll_cycle_is_idempotent`, `test_ingest_service.py`).
+2. **Artemis: the md5 buffering** — the one item that can break Echo's first real run.
+3. **ProtonVPN egress** — Codex session; the anonymity property is not in place without it.
+4. **Artemis: `tags`/`source` on upload** — would let Echo stamp `source` as decided.
+5. **Lexicon: a `video.ingested` message** — when a consumer exists.
 6. Artemis **watched-state** and the **`pool:`** metatag — unchanged: surfaced, unauthorized, no
-   date. `notify/` designs against the `GET /pools/{id}/posts` fallback.
+   date. The nudge stays suppressed until watched-state lands.
